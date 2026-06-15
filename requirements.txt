@@ -1,2 +1,5 @@
 opencv-python 
-pytesseract
+pytesseract 
+imutils 
+numpy 
+pillow
