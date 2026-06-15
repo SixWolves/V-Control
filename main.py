@@ -8,12 +8,13 @@ import pytesseract
 import imutils
 import numpy as np
 import re
-import threading  # Biblioteca nativa para Multi-Threading
+import threading
+import time
 
 # ATENÇÃO: Ajuste o caminho abaixo se estiver usando Windows
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-class SistemaPortariaMultiThread:
+class SistemaPortariaHibrido:
     def __init__(self, window, window_title):
         self.window = window
         self.window.title(window_title)
@@ -22,19 +23,16 @@ class SistemaPortariaMultiThread:
         self.init_db()
         self.cap = cv2.VideoCapture(0)
         
-        # --- VARIÁVEIS DE CONTROLE DE MULTI-THREAD E LPR ---
-        self.placa_atual = ""
-        self.coords_placa = (0, 0, 0, 0)
-        self.ultima_placa_gravada = ""
-        
-        # Flag de controle: impede o disparo de novas threads se uma já estiver calculando o OCR
+        # --- VARIÁVEIS DE CONTROLE ---
+        self.placa_exibida = ""       
+        self.coords_exibidas = (0, 0, 0, 0) 
+        self.timestamp_expira = 0.0   
+        self.ultima_placa_gravada = "" 
         self.ocr_em_andamento = False 
         
-        # Como o OCR em background roda menos vezes por segundo, reduzimos o limiar de confirmação
-        self.leituras_consecutivas = 0
-        self.limiar_confirmacao = 3 
-        
-        self.padrao_placa = re.compile(r'^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$')
+        # --- EXPRESSÕES REGULARES (PADRÕES BRASILEIROS) ---
+        self.padrao_antigo = re.compile(r'^[A-Z]{3}-[0-9]{4}$')             # Espera a leitura exata ABC-1234
+        self.padrao_mercosul = re.compile(r'^[A-Z]{3}[0-9][A-Z][0-9]{2}$')    # ABC1D23
 
         # --- ESTRUTURA DE ABAS ---
         self.notebook = ttk.Notebook(window)
@@ -71,58 +69,56 @@ class SistemaPortariaMultiThread:
         self.canvas = tk.Canvas(self.tab_monitoramento, width=640, height=480, bg="black")
         self.canvas.pack(pady=10)
 
-        self.frame_status = tk.LabelFrame(self.tab_monitoramento, text=" Status da Leitura (Multi-Thread Ativo) ", font=("Arial", 11, "bold"), padx=15, pady=10)
+        self.frame_status = tk.LabelFrame(self.tab_monitoramento, text=" Status do Sistema ", font=("Arial", 11, "bold"), padx=15, pady=10)
         self.frame_status.pack(fill=tk.X, padx=20, pady=10)
 
-        self.lbl_placa = tk.Label(self.frame_status, text="Buscando placas em background...", font=("Arial", 14, "bold"), fg="gray")
+        self.lbl_placa = tk.Label(self.frame_status, text="Buscando veículos (Antigo/Mercosul)...", font=("Arial", 14, "bold"), fg="gray")
         self.lbl_placa.grid(row=0, column=0, padx=20, sticky=tk.W)
 
         self.lbl_vinculo = tk.Label(self.frame_status, text="Vínculo: --", font=("Arial", 12), fg="gray")
         self.lbl_vinculo.grid(row=0, column=1, padx=20, sticky=tk.W)
 
     def update_video(self):
-        """Thread Principal: Foca exclusivamente em capturar o vídeo e renderizar a tela"""
+        """Thread Principal: Renderização fluida da interface gráfica"""
         ret, frame = self.cap.read()
         if ret:
             frame = cv2.resize(frame, (640, 480))
+            tempo_atual = time.time()
 
-            # SE não houver nenhuma thread de OCR rodando agora, cria uma nova em background
-            if not self.ocr_em_andamento:
-                self.ocr_em_andamento = True
+            # Se houver uma placa retida nos 5 segundos de exibição
+            if self.placa_exibida and tempo_atual < self.timestamp_expira:
+                x, y, w, h = self.coords_exibidas
                 
-                # IMPORTANTE: Clonamos o frame (.copy()) para que a thread secundária use uma foto estática
-                # enquanto a thread principal continua atualizando o frame da câmera ao vivo
-                frame_para_ocr = frame.copy()
-                
-                # Cria e inicia a thread paralela
-                threading.Thread(target=self.processar_ocr_background, args=(frame_para_ocr,), daemon=True).start()
-
-            # Desenha os resultados na tela caso uma placa tenha sido detectada pela outra thread
-            if self.placa_atual:
-                x, y, w, h = self.coords_placa
+                # Renderiza o enquadramento estável sobre o veículo
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                cv2.putText(frame, self.placa_atual, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.putText(frame, self.placa_exibida, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-                self.lbl_placa.config(text=f"Placa Identificada: {self.placa_atual}", fg="blue")
-                morador = self.verificar_morador(self.placa_atual)
-                vinculo = f"Morador: {morador[0]} ({morador[1]})" if morador else "Visitante"
-                self.lbl_vinculo.config(text=vinculo, fg="green" if morador else "orange")
+                self.lbl_placa.config(text=f"Placa Identificada: {self.placa_exibida}", fg="blue")
+                
+                # Grava no banco apenas uma vez por ciclo de detecção
+                if self.placa_exibida != self.ultima_placa_gravada:
+                    morador = self.verificar_morador(self.placa_exibida)
+                    vinculo = f"Morador: {morador[0]} ({morador[1]})" if morador else "Visitante"
+                    self.lbl_vinculo.config(text=vinculo, fg="green" if morador else "orange")
+                    
+                    self.registrar_movimento(self.placa_exibida, vinculo)
+                    self.ultima_placa_gravada = self.placa_exibida
 
-                # Lógica de estabilização automatizada baseada em confirmações seguidas
-                if self.placa_atual != self.ultima_placa_gravada:
-                    self.leituras_consecutivas += 1
-                    if self.leituras_consecutivas >= self.limiar_confirmacao:
-                        self.registrar_movimento(self.placa_atual, vinculo)
-                        self.ultima_placa_gravada = self.placa_atual
-                        self.leituras_consecutivas = 0
-                else:
-                    self.leituras_consecutivas = 0
+            # Se o tempo expirou ou o visor está livre, busca novas placas
             else:
-                self.leituras_consecutivas = 0
-                self.lbl_placa.config(text="Buscando placas em background...", fg="gray")
+                if self.placa_exibida:
+                    self.placa_exibida = ""
+                    self.coords_exibidas = (0, 0, 0, 0)
+                    self.ultima_placa_gravada = "" 
+
+                self.lbl_placa.config(text="Buscando veículos (Antigo/Mercosul)...", fg="gray")
                 self.lbl_vinculo.config(text="Vínculo: --", fg="gray")
 
-            # Converte e exibe o feed de vídeo sem lags
+                if not self.ocr_em_andamento:
+                    self.ocr_em_andamento = True
+                    frame_para_ocr = frame.copy()
+                    threading.Thread(target=self.processar_ocr_background, args=(frame_para_ocr,), daemon=True).start()
+
             cv_img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(cv_img)
             self.photo = ImageTk.PhotoImage(image=pil_img)
@@ -131,7 +127,7 @@ class SistemaPortariaMultiThread:
         self.window.after(self.delay, self.update_video)
 
     def processar_ocr_background(self, frame):
-        """Thread Secundária: Executa todo o processamento de imagem pesado em segundo plano"""
+        """Thread Secundária: Filtros de imagem e processamento OCR sem travar a tela"""
         try:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray = cv2.bilateralFilter(gray, 11, 17, 17)
@@ -152,37 +148,37 @@ class SistemaPortariaMultiThread:
                 x, y, w, h = cv2.boundingRect(local_placa)
                 cropped_image = gray[y:y+h, x:x+w]
                 
-                config_tesseract = r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+                # Adicionado o hífen (-) no final da whitelist
+                config_tesseract = r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
                 texto = pytesseract.image_to_string(cropped_image, config=config_tesseract)
-                texto_limpo = "".join(e for e in texto if e.isalnum()).upper()
                 
-                if self.padrao_placa.match(texto_limpo):
-                    # Se achou uma placa válida, repassa os dados para as variáveis compartilhadas
-                    self.placa_atual = texto_limpo
-                    self.coords_placa = (x, y, w, h)
-                    self.ocr_em_andamento = False
+                # Modificado para manter letras, números e o hífen
+                texto_limpo = "".join(e for e in texto if e.isalnum() or e == '-').upper()
+                
+                # Teste 1: Validação do Padrão Clássico (ABC-1234)
+                if self.padrao_antigo.match(texto_limpo):
+                    self.placa_exibida = texto_limpo # Já recebe do OCR com o hífen nativo
+                    self.coords_exibidas = (x, y, w, h)
+                    self.timestamp_expira = time.time() + 5.0
+                    return
+                # Teste 2: Validação do Padrão Mercosul (ABC1D23)
+                elif self.padrao_mercosul.match(texto_limpo):
+                    self.placa_exibida = texto_limpo # Mantém contínuo conforme o padrão original
+                    self.coords_exibidas = (x, y, w, h)
+                    self.timestamp_expira = time.time() + 5.0
                     return
 
-            # Se não detectou nada neste frame, limpa a placa atual
-            self.placa_atual = ""
-            self.coords_placa = (0, 0, 0, 0)
-            
         except Exception as e:
-            print(f"Erro no processamento em background: {e}")
-            
+            print(f"Erro no processamento OCR: {e}")
         finally:
-            # Libera a trava de segurança para permitir que o próximo ciclo crie outra thread
             self.ocr_em_andamento = False
 
     def registrar_movimento(self, placa, vinculo):
         agora = datetime.now()
         tipo = self.inferir_tipo_movimento(placa)
-        
-        # Como a gravação manipula o SQLite, realizamos na Thread Principal com segurança
         self.cursor.execute("INSERT INTO registros (placa, tipo, data, hora, vinculo) VALUES (?, ?, ?, ?, ?)",
                             (placa, tipo, agora.strftime("%d/%m/%Y"), agora.strftime("%H:%M:%S"), vinculo))
         self.conn.commit()
-        print(f"[REGISTRO AUTOMÁTICO] {tipo} - Placa: {placa} ({vinculo})")
 
     def inferir_tipo_movimento(self, placa):
         self.cursor.execute("SELECT tipo FROM registros WHERE placa = ? ORDER BY id DESC LIMIT 1", (placa,))
@@ -193,7 +189,7 @@ class SistemaPortariaMultiThread:
         self.cursor.execute("SELECT nome, unidade FROM moradores WHERE placa = ?", (placa,))
         return self.cursor.fetchone()
 
-    # --- GERENCIAMENTO DE INTERFACE DAS OUTRAS ABAS ---
+    # --- ABA: HISTÓRICO ---
     def configurar_aba_historico(self):
         frame = tk.Frame(self.tab_historico)
         frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
@@ -212,13 +208,14 @@ class SistemaPortariaMultiThread:
         if aba == 1: self.atualizar_tabela_historico()
         elif aba == 2: self.atualizar_tabela_moradores()
 
+    # --- ABA: CADASTRO DE MORADORES ---
     def configurar_aba_moradores(self):
-        frame = tk.LabelFrame(self.tab_moradores, text=" Novo Cadastro de Morador ")
+        frame = tk.LabelFrame(self.tab_moradores, text=" Cadastro de Moradores ")
         frame.pack(fill=tk.X, padx=15, pady=10)
-        self.ent_nome = tk.Entry(frame); self.ent_nome.pack(side=tk.LEFT, padx=5, pady=5)
-        self.ent_unidade = tk.Entry(frame); self.ent_unidade.pack(side=tk.LEFT, padx=5, pady=5)
-        self.ent_placa = tk.Entry(frame); self.ent_placa.pack(side=tk.LEFT, padx=5, pady=5)
-        tk.Button(frame, text="Salvar Morador", bg="#3498db", fg="white", command=self.salvar_morador).pack(side=tk.LEFT, padx=10)
+        self.ent_nome = tk.Entry(frame, width=20); self.ent_nome.pack(side=tk.LEFT, padx=5, pady=5)
+        self.ent_unidade = tk.Entry(frame, width=10); self.ent_unidade.pack(side=tk.LEFT, padx=5, pady=5)
+        self.ent_placa = tk.Entry(frame, width=15); self.ent_placa.pack(side=tk.LEFT, padx=5, pady=5)
+        tk.Button(frame, text="Salvar", bg="#3498db", fg="white", command=self.salvar_morador).pack(side=tk.LEFT, padx=10)
 
         frame_tb = tk.Frame(self.tab_moradores)
         frame_tb.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
@@ -236,8 +233,8 @@ class SistemaPortariaMultiThread:
                 self.conn.commit()
                 self.ent_nome.delete(0, tk.END); self.ent_unidade.delete(0, tk.END); self.ent_placa.delete(0, tk.END)
                 self.atualizar_tabela_moradores()
-                messagebox.showinfo("Sucesso", "Morador cadastrado!")
-            except: messagebox.showerror("Erro", "Placa já cadastrada ou dados inválidos.")
+                messagebox.showinfo("Sucesso", "Morador cadastrado com sucesso!")
+            except: messagebox.showerror("Erro", "Verifique se os dados ou a placa já existem.")
 
     def atualizar_tabela_moradores(self):
         for item in self.tree_moradores.get_children(): self.tree_moradores.delete(item)
@@ -251,5 +248,5 @@ class SistemaPortariaMultiThread:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = SistemaPortariaMultiThread(root, "LPR Condomínio - Alta Fluidez (Multi-Thread)")
+    app = SistemaPortariaHibrido(root, "Monitoramento LPR - Dual Padrão (5s Retenção)")
     root.mainloop()
