@@ -20,6 +20,14 @@ class SistemaPortariaHibrido:
         self.window.title(window_title)
         self.window.geometry("950x800")
         
+        # --- PALETA DE CORES TEMA ESCURO ---
+        self.bg_main = "#121212"      # Fundo principal
+        self.bg_panel = "#1e1e1e"     # Fundo de painéis/frames
+        self.fg_text = "#ffffff"      # Texto principal (Branco)
+        self.fg_muted = "#b3b3b3"     # Texto secundário (Cinza claro)
+        
+        self.window.configure(bg=self.bg_main)
+        
         self.init_db()
         self.cap = cv2.VideoCapture(0)
         
@@ -29,18 +37,38 @@ class SistemaPortariaHibrido:
         self.timestamp_expira = 0.0   
         self.ultima_placa_gravada = "" 
         self.ocr_em_andamento = False 
+
+        # --- VARIÁVEIS DE ESTABILIZAÇÃO (NOVO) ---
+        self.leitura_temporaria = ""
+        self.contador_leituras = 0
+        self.limiar_confirmacao = 3 # Exige 3 leituras idênticas seguidas para ter certeza
         
-        # --- EXPRESSÕES REGULARES (PADRÕES BRASILEIROS) ---
-        self.padrao_antigo = re.compile(r'^[A-Z]{3}-[0-9]{4}$')             # Espera a leitura exata ABC-1234
-        self.padrao_mercosul = re.compile(r'^[A-Z]{3}[0-9][A-Z][0-9]{2}$')    # ABC1D23
+        # --- EXPRESSÕES REGULARES ---
+        self.padrao_antigo = re.compile(r'^[A-Z]{3}-[0-9]{4}$')              # Exige ABC-1234
+        self.padrao_mercosul = re.compile(r'^[A-Z]{3}[0-9][A-Z][0-9]{2}$')     # ABC1D23
+
+        # --- ESTILIZAÇÃO AVANÇADA (DARK MODE PARA ABAS E TABELAS) ---
+        self.style = ttk.Style()
+        self.style.theme_use('clam') # Clam permite customizar cores que o Windows normalmente bloqueia
+        
+        # Estilo das Abas (Notebook)
+        self.style.configure("TNotebook", background=self.bg_main, borderwidth=0)
+        self.style.configure("TNotebook.Tab", background=self.bg_panel, foreground=self.fg_text, padding=[15, 5], font=("Arial", 10, "bold"))
+        self.style.map("TNotebook.Tab", background=[("selected", "#3498db")]) # Aba selecionada fica azul
+        
+        # Estilo das Tabelas (Treeview)
+        self.style.configure("Treeview", background=self.bg_panel, foreground=self.fg_text, fieldbackground=self.bg_panel, borderwidth=0)
+        self.style.configure("Treeview.Heading", background="#2c3e50", foreground=self.fg_text, font=("Arial", 10, "bold"))
+        self.style.map("Treeview", background=[('selected', '#3498db')])
 
         # --- ESTRUTURA DE ABAS ---
         self.notebook = ttk.Notebook(window)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        self.tab_monitoramento = tk.Frame(self.notebook)
-        self.tab_historico = tk.Frame(self.notebook)
-        self.tab_moradores = tk.Frame(self.notebook)
+        # Configura as frames das abas com fundo escuro
+        self.tab_monitoramento = tk.Frame(self.notebook, bg=self.bg_main)
+        self.tab_historico = tk.Frame(self.notebook, bg=self.bg_main)
+        self.tab_moradores = tk.Frame(self.notebook, bg=self.bg_main)
 
         self.notebook.add(self.tab_monitoramento, text=" Monitoramento ")
         self.notebook.add(self.tab_historico, text=" Histórico ")
@@ -66,53 +94,47 @@ class SistemaPortariaHibrido:
         self.conn.commit()
 
     def configurar_aba_monitoramento(self):
-        self.canvas = tk.Canvas(self.tab_monitoramento, width=640, height=480, bg="black")
-        self.canvas.pack(pady=10)
+        self.canvas = tk.Canvas(self.tab_monitoramento, width=640, height=480, bg="#000000", highlightthickness=2, highlightbackground="#3498db")
+        self.canvas.pack(pady=15)
 
-        self.frame_status = tk.LabelFrame(self.tab_monitoramento, text=" Status do Sistema ", font=("Arial", 11, "bold"), padx=15, pady=10)
+        self.frame_status = tk.LabelFrame(self.tab_monitoramento, text=" Status do Sistema ", font=("Arial", 11, "bold"), 
+                                          bg=self.bg_panel, fg="#3498db", padx=15, pady=10)
         self.frame_status.pack(fill=tk.X, padx=20, pady=10)
 
-        self.lbl_placa = tk.Label(self.frame_status, text="Buscando veículos (Antigo/Mercosul)...", font=("Arial", 14, "bold"), fg="gray")
+        self.lbl_placa = tk.Label(self.frame_status, text="Buscando veículos...", font=("Arial", 14, "bold"), bg=self.bg_panel, fg=self.fg_muted)
         self.lbl_placa.grid(row=0, column=0, padx=20, sticky=tk.W)
 
-        self.lbl_vinculo = tk.Label(self.frame_status, text="Vínculo: --", font=("Arial", 12), fg="gray")
+        self.lbl_vinculo = tk.Label(self.frame_status, text="Vínculo: --", font=("Arial", 12), bg=self.bg_panel, fg=self.fg_muted)
         self.lbl_vinculo.grid(row=0, column=1, padx=20, sticky=tk.W)
 
     def update_video(self):
-        """Thread Principal: Renderização fluida da interface gráfica"""
         ret, frame = self.cap.read()
         if ret:
             frame = cv2.resize(frame, (640, 480))
             tempo_atual = time.time()
 
-            # Se houver uma placa retida nos 5 segundos de exibição
             if self.placa_exibida and tempo_atual < self.timestamp_expira:
                 x, y, w, h = self.coords_exibidas
-                
-                # Renderiza o enquadramento estável sobre o veículo
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.putText(frame, self.placa_exibida, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-                self.lbl_placa.config(text=f"Placa Identificada: {self.placa_exibida}", fg="blue")
+                self.lbl_placa.config(text=f"Placa Identificada: {self.placa_exibida}", fg="#2ecc71") # Verde neon
                 
-                # Grava no banco apenas uma vez por ciclo de detecção
                 if self.placa_exibida != self.ultima_placa_gravada:
                     morador = self.verificar_morador(self.placa_exibida)
                     vinculo = f"Morador: {morador[0]} ({morador[1]})" if morador else "Visitante"
-                    self.lbl_vinculo.config(text=vinculo, fg="green" if morador else "orange")
+                    self.lbl_vinculo.config(text=vinculo, fg="#2ecc71" if morador else "#f39c12") # Verde ou Laranja
                     
                     self.registrar_movimento(self.placa_exibida, vinculo)
                     self.ultima_placa_gravada = self.placa_exibida
-
-            # Se o tempo expirou ou o visor está livre, busca novas placas
             else:
                 if self.placa_exibida:
                     self.placa_exibida = ""
                     self.coords_exibidas = (0, 0, 0, 0)
                     self.ultima_placa_gravada = "" 
 
-                self.lbl_placa.config(text="Buscando veículos (Antigo/Mercosul)...", fg="gray")
-                self.lbl_vinculo.config(text="Vínculo: --", fg="gray")
+                self.lbl_placa.config(text="Buscando veículos (Antigo/Mercosul)...", fg=self.fg_muted)
+                self.lbl_vinculo.config(text="Vínculo: --", fg=self.fg_muted)
 
                 if not self.ocr_em_andamento:
                     self.ocr_em_andamento = True
@@ -127,7 +149,6 @@ class SistemaPortariaHibrido:
         self.window.after(self.delay, self.update_video)
 
     def processar_ocr_background(self, frame):
-        """Thread Secundária: Filtros de imagem e processamento OCR sem travar a tela"""
         try:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray = cv2.bilateralFilter(gray, 11, 17, 17)
@@ -148,31 +169,47 @@ class SistemaPortariaHibrido:
                 x, y, w, h = cv2.boundingRect(local_placa)
                 cropped_image = gray[y:y+h, x:x+w]
                 
-                # Adicionado o hífen (-) no final da whitelist
                 config_tesseract = r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
                 texto = pytesseract.image_to_string(cropped_image, config=config_tesseract)
-                
-                # Modificado para manter letras, números e o hífen
                 texto_limpo = "".join(e for e in texto if e.isalnum() or e == '-').upper()
                 
-                # Teste 1: Validação do Padrão Clássico (ABC-1234)
+                placa_candidata = ""
+                
+                # Teste 1: Padrão Antigo com Hífen (ABC-1234)
                 if self.padrao_antigo.match(texto_limpo):
-                    self.placa_exibida = texto_limpo # Já recebe do OCR com o hífen nativo
-                    self.coords_exibidas = (x, y, w, h)
-                    self.timestamp_expira = time.time() + 5.0
-                    return
-                # Teste 2: Validação do Padrão Mercosul (ABC1D23)
+                    placa_candidata = texto_limpo
+                # Teste 2: Padrão Mercosul (ABC1D23)
                 elif self.padrao_mercosul.match(texto_limpo):
-                    self.placa_exibida = texto_limpo # Mantém contínuo conforme o padrão original
-                    self.coords_exibidas = (x, y, w, h)
-                    self.timestamp_expira = time.time() + 5.0
-                    return
+                    placa_candidata = texto_limpo
+
+                # Se passou nos filtros de formato, entra na trava de estabilização
+                if placa_candidata:
+                    if placa_candidata == self.leitura_temporaria:
+                        self.contador_leituras += 1
+                    else:
+                        # Se leu algo diferente, quebra a sequência e recomeça a contagem
+                        self.leitura_temporaria = placa_candidata
+                        self.contador_leituras = 1
+                        
+                    # Se atingiu o combo (3 leituras idênticas), confirma a placa!
+                    if self.contador_leituras >= self.limiar_confirmacao:
+                        self.placa_exibida = placa_candidata 
+                        self.coords_exibidas = (x, y, w, h)
+                        self.timestamp_expira = time.time() + 5.0
+                        
+                        # Reseta a memória de estabilização para o próximo carro
+                        self.contador_leituras = 0
+                        self.leitura_temporaria = ""
+                        
+                    return # Encerra o processamento deste frame
+            
+            # Se não achou contorno de placa ou o texto foi apenas lixo visual, zera a contagem
+            self.contador_leituras = 0
 
         except Exception as e:
             print(f"Erro no processamento OCR: {e}")
         finally:
             self.ocr_em_andamento = False
-
     def registrar_movimento(self, placa, vinculo):
         agora = datetime.now()
         tipo = self.inferir_tipo_movimento(placa)
@@ -191,8 +228,9 @@ class SistemaPortariaHibrido:
 
     # --- ABA: HISTÓRICO ---
     def configurar_aba_historico(self):
-        frame = tk.Frame(self.tab_historico)
+        frame = tk.Frame(self.tab_historico, bg=self.bg_main)
         frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        
         self.tree_historico = ttk.Treeview(frame, columns=("ID", "Placa", "Tipo", "Data", "Horario", "Vinculo"), show="headings")
         for col in self.tree_historico["columns"]:
             self.tree_historico.heading(col, text=col)
@@ -210,15 +248,29 @@ class SistemaPortariaHibrido:
 
     # --- ABA: CADASTRO DE MORADORES ---
     def configurar_aba_moradores(self):
-        frame = tk.LabelFrame(self.tab_moradores, text=" Cadastro de Moradores ")
+        frame = tk.LabelFrame(self.tab_moradores, text=" Cadastro de Moradores ", font=("Arial", 11, "bold"), 
+                              bg=self.bg_panel, fg="#3498db", padx=15, pady=10)
         frame.pack(fill=tk.X, padx=15, pady=10)
-        self.ent_nome = tk.Entry(frame, width=20); self.ent_nome.pack(side=tk.LEFT, padx=5, pady=5)
-        self.ent_unidade = tk.Entry(frame, width=10); self.ent_unidade.pack(side=tk.LEFT, padx=5, pady=5)
-        self.ent_placa = tk.Entry(frame, width=15); self.ent_placa.pack(side=tk.LEFT, padx=5, pady=5)
-        tk.Button(frame, text="Salvar", bg="#3498db", fg="white", command=self.salvar_morador).pack(side=tk.LEFT, padx=10)
+        
+        # Labels escuras
+        tk.Label(frame, text="Nome:", bg=self.bg_panel, fg=self.fg_text).pack(side=tk.LEFT, padx=(5,0))
+        self.ent_nome = tk.Entry(frame, width=20, bg="#2b2b2b", fg=self.fg_text, insertbackground=self.fg_text)
+        self.ent_nome.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        tk.Label(frame, text="Unidade:", bg=self.bg_panel, fg=self.fg_text).pack(side=tk.LEFT, padx=(10,0))
+        self.ent_unidade = tk.Entry(frame, width=10, bg="#2b2b2b", fg=self.fg_text, insertbackground=self.fg_text)
+        self.ent_unidade.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        tk.Label(frame, text="Placa:", bg=self.bg_panel, fg=self.fg_text).pack(side=tk.LEFT, padx=(10,0))
+        self.ent_placa = tk.Entry(frame, width=15, bg="#2b2b2b", fg=self.fg_text, insertbackground=self.fg_text)
+        self.ent_placa.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        tk.Button(frame, text="Salvar Morador", bg="#3498db", fg="white", font=("Arial", 10, "bold"), 
+                  relief=tk.FLAT, command=self.salvar_morador).pack(side=tk.LEFT, padx=15)
 
-        frame_tb = tk.Frame(self.tab_moradores)
+        frame_tb = tk.Frame(self.tab_moradores, bg=self.bg_main)
         frame_tb.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
+        
         self.tree_moradores = ttk.Treeview(frame_tb, columns=("ID", "Nome", "Unidade", "Placa"), show="headings")
         for col in self.tree_moradores["columns"]: self.tree_moradores.heading(col, text=col)
         self.tree_moradores.pack(fill=tk.BOTH, expand=True)
@@ -226,15 +278,46 @@ class SistemaPortariaHibrido:
     def salvar_morador(self):
         nome = self.ent_nome.get().strip()
         unidade = self.ent_unidade.get().strip()
-        placa = self.ent_placa.get().strip().upper()
-        if nome and unidade and placa:
-            try:
-                self.cursor.execute("INSERT INTO moradores (nome, unidade, placa) VALUES (?, ?, ?)", (nome, unidade, placa))
-                self.conn.commit()
-                self.ent_nome.delete(0, tk.END); self.ent_unidade.delete(0, tk.END); self.ent_placa.delete(0, tk.END)
-                self.atualizar_tabela_moradores()
-                messagebox.showinfo("Sucesso", "Morador cadastrado com sucesso!")
-            except: messagebox.showerror("Erro", "Verifique se os dados ou a placa já existem.")
+        placa_digitada = self.ent_placa.get().strip().upper()
+        
+        if not nome or not unidade or not placa_digitada:
+            messagebox.showwarning("Aviso", "Preencha todos os campos do cadastro!")
+            return
+
+        # 1. Limpeza: Remove traços ou espaços caso o usuário tenha digitado sem querer
+        placa_limpa = "".join(e for e in placa_digitada if e.isalnum())
+        
+        # 2. Identificação e Formatação Automática
+        if re.match(r'^[A-Z]{3}[0-9]{4}$', placa_limpa):
+            # Se for placa antiga (3 letras e 4 números), coloca o traço sozinho
+            placa_final = f"{placa_limpa[:3]}-{placa_limpa[3:]}" 
+            
+        elif re.match(r'^[A-Z]{3}[0-9][A-Z][0-9]{2}$', placa_limpa):
+            # Se for Mercosul, mantém o formato contínuo
+            placa_final = placa_limpa 
+            
+        else:
+            # Trava de segurança para impedir o cadastro de lixo no banco de dados
+            messagebox.showerror("Erro", "Formato inválido! Digite uma placa real (ex: ABC1234 ou ABC1D23).")
+            return
+
+        # 3. Gravação no Banco de Dados
+        try:
+            self.cursor.execute("INSERT INTO moradores (nome, unidade, placa) VALUES (?, ?, ?)", (nome, unidade, placa_final))
+            self.conn.commit()
+            
+            # Limpa os campos da tela
+            self.ent_nome.delete(0, tk.END)
+            self.ent_unidade.delete(0, tk.END)
+            self.ent_placa.delete(0, tk.END)
+            
+            self.atualizar_tabela_moradores()
+            messagebox.showinfo("Sucesso", f"Morador cadastrado! Placa salva como: {placa_final}")
+            
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Erro", "Esta placa já pertence a outro morador cadastrado.")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro no banco de dados: {e}")
 
     def atualizar_tabela_moradores(self):
         for item in self.tree_moradores.get_children(): self.tree_moradores.delete(item)
@@ -248,5 +331,5 @@ class SistemaPortariaHibrido:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = SistemaPortariaHibrido(root, "Monitoramento LPR - Dual Padrão (5s Retenção)")
+    app = SistemaPortariaHibrido(root, "Monitoramento LPR - Modo Escuro")
     root.mainloop()
