@@ -1,5 +1,4 @@
-opencv-python 
-pytesseract 
-imutils 
-numpy 
+opencv-python
 pillow
+ultralytics
+easyocr

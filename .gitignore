@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
 venv/
+.venv313/
 .env
-regitro_portaria.db
+registro_portaria.db
