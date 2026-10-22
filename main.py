@@ -464,28 +464,36 @@ class SistemaPortariaHibrido:
                 )
 
                 if not resultados_ocr:
-                    self.contador_leituras = 0
                     return
 
                 placa_candidata = ""
 
                 for _, txt, confianca in resultados_ocr:
                     texto_limpo = "".join(e for e in txt if e.isalnum()).upper()
-                    print(f"OCR: {texto_limpo} | Confiança: {confianca:.3f}")
-
-                    # Ignorar leituras com baixa confiança do EasyOCR
-                    if confianca < 0.70:
+                    if not texto_limpo:
                         continue
 
-                    if len(texto_limpo) == 7:
-                        if self.padrao_antigo.match(texto_limpo) or self.padrao_mercosul.match(texto_limpo):
-                            placa_candidata = texto_limpo
+                    if len(texto_limpo) != 7:
+                        print(f"OCR: {texto_limpo} | Confiança: {confianca:.3f} -> [Ignorado: cabeçalho/ruído ({len(texto_limpo)} chars)]")
+                        continue
+
+                    # Ignorar leituras com baixa confiança do EasyOCR (< 0.50)
+                    if confianca < 0.50:
+                        print(f"OCR: {texto_limpo} | Confiança: {confianca:.3f} -> [Ignorado: baixa confiança]")
+                        continue
+
+                    if self.padrao_antigo.match(texto_limpo) or self.padrao_mercosul.match(texto_limpo):
+                        placa_candidata = texto_limpo
+                        print(f"OCR: {texto_limpo} | Confiança: {confianca:.3f} -> [Formato de Placa OK]")
+                        break
+                    else:
+                        texto_corrigido = self.corrigir_caracteres_confusos(texto_limpo)
+                        if self.padrao_antigo.match(texto_corrigido) or self.padrao_mercosul.match(texto_corrigido):
+                            placa_candidata = texto_corrigido
+                            print(f"OCR: {texto_limpo} -> Corrigido: {texto_corrigido} | Confiança: {confianca:.3f} -> [Formato de Placa OK]")
                             break
                         else:
-                            texto_corrigido = self.corrigir_caracteres_confusos(texto_limpo)
-                            if self.padrao_antigo.match(texto_corrigido) or self.padrao_mercosul.match(texto_corrigido):
-                                placa_candidata = texto_corrigido
-                                break
+                            print(f"OCR: {texto_limpo} | Confiança: {confianca:.3f} -> [Ignorado: fora do padrão de placa]")
 
                 if placa_candidata:
                     placa_candidata = self.normalizar_placa(placa_candidata)
@@ -495,7 +503,10 @@ class SistemaPortariaHibrido:
                         self.leitura_temporaria = placa_candidata
                         self.contador_leituras = 1
 
+                    print(f"   [Validação] Placa: {placa_candidata} ({self.contador_leituras}/{self.limiar_confirmacao})")
+
                     if self.contador_leituras >= self.limiar_confirmacao:
+                        print(f"   >>> PLACA CONFIRMADA E REGISTRADA: {placa_candidata} <<<")
                         resultado_fila["confirmada"] = True
                         resultado_fila["placa"] = placa_candidata
                         resultado_fila["coords"] = melhor_box
@@ -503,8 +514,6 @@ class SistemaPortariaHibrido:
                         self.contador_leituras = 0
                         self.leitura_temporaria = ""
                         return
-
-            self.contador_leituras = 0
 
         except Exception as e:
             print(f"Erro no processamento YOLO/EasyOCR: {e}")
