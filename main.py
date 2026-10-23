@@ -3,15 +3,16 @@ import sys
 import re
 import time
 import queue
+import shutil
 import sqlite3
 import threading
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 import cv2
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageOps, ImageDraw
 from ultralytics import YOLO
 import easyocr
 
@@ -26,9 +27,16 @@ class SistemaPortariaHibrido:
     def __init__(self, window, window_title):
         self.window = window
         self.window.title(window_title)
-        self.window.geometry("980x820")
-        self.window.minsize(900, 760)
+        self.window.geometry("1180x830")
+        self.window.minsize(1100, 760)
         self.window.configure(bg=CORES["bg_main"])
+
+        # Pasta local para armazenar as fotos dos condutores autorizados
+        self.pasta_fotos = Path(__file__).resolve().parent / "fotos_condutores"
+        self.pasta_fotos.mkdir(exist_ok=True)
+        self.foto_selecionada_temp = ""
+        self.id_em_edicao = None  # Guarda o ID do registro quando estiver em modo de edição
+        self.fotos_condutores_refs = []  # Mantém referências de ImageTk para o garbage collector não apagar
 
         print("Carregando IA YOLOv8 e EasyOCR...")
         self.modelo_yolo = YOLO("license_plate_detector.pt")
@@ -75,6 +83,7 @@ class SistemaPortariaHibrido:
 
         # --- VARIÁVEIS DE CONTROLE E ESTABILIZAÇÃO ---
         self.placa_exibida = ""
+        self.placa_painel_renderizada = None
         self.coords_exibidas = (0, 0, 0, 0)
         self.timestamp_expira = 0.0
         self.ultima_placa_gravada = ""
@@ -116,7 +125,7 @@ class SistemaPortariaHibrido:
 
         tk.Label(
             self.header_frame,
-            text="  |  Monitoramento e Controle de Acesso Veicular (YOLOv8 + EasyOCR)",
+            text="  |  Monitoramento LPR e Verificação Visual de Condutores (YOLOv8 + EasyOCR)",
             font=FONTES["label"],
             bg=CORES["bg_header"],
             fg=CORES["fg_muted"]
@@ -143,7 +152,7 @@ class SistemaPortariaHibrido:
 
         self.notebook.add(self.tab_monitoramento, text="  Monitoramento Ao Vivo  ")
         self.notebook.add(self.tab_historico, text="  Histórico de Acessos  ")
-        self.notebook.add(self.tab_moradores, text="  Cadastro de Moradores  ")
+        self.notebook.add(self.tab_moradores, text="  Moradores e Condutores  ")
 
         self.configurar_aba_monitoramento()
         self.configurar_aba_historico()
@@ -193,19 +202,44 @@ class SistemaPortariaHibrido:
             conn.execute("""CREATE TABLE IF NOT EXISTS registros 
                                 (id INTEGER PRIMARY KEY AUTOINCREMENT, placa TEXT NOT NULL, tipo TEXT NOT NULL, data TEXT NOT NULL, hora TEXT NOT NULL, vinculo TEXT)""")
             conn.execute("""CREATE TABLE IF NOT EXISTS moradores 
-                                (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL, unidade TEXT NOT NULL, placa TEXT NOT NULL UNIQUE)""")
+                                (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL, unidade TEXT NOT NULL, placa TEXT NOT NULL, veiculo TEXT DEFAULT '', foto_path TEXT DEFAULT '')""")
+
+            # Migração automática: garante que colunas 'veiculo' e 'foto_path' existam e que 'placa' permita múltiplos condutores
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(moradores)")
+            colunas = [info[1] for info in cursor.fetchall()]
+
+            cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='moradores'")
+            row_sql = cursor.fetchone()
+            sql_tabela = row_sql[0].upper() if row_sql and row_sql[0] else ""
+
+            if "foto_path" not in colunas or "veiculo" not in colunas or "UNIQUE" in sql_tabela:
+                conn.execute("""CREATE TABLE IF NOT EXISTS moradores_novo 
+                                    (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL, unidade TEXT NOT NULL, placa TEXT NOT NULL, veiculo TEXT DEFAULT '', foto_path TEXT DEFAULT '')""")
+                col_veiculo = "COALESCE(veiculo, '')" if "veiculo" in colunas else "''"
+                col_foto = "COALESCE(foto_path, '')" if "foto_path" in colunas else "''"
+                conn.execute(f"INSERT INTO moradores_novo (id, nome, unidade, placa, veiculo, foto_path) SELECT id, nome, unidade, placa, {col_veiculo}, {col_foto} FROM moradores")
+                conn.execute("DROP TABLE moradores")
+                conn.execute("ALTER TABLE moradores_novo RENAME TO moradores")
+
             conn.execute("""CREATE INDEX IF NOT EXISTS idx_registros_placa ON registros(placa)""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_moradores_placa ON moradores(placa)""")
 
     def configurar_aba_monitoramento(self):
+        # Área central dividida lado a lado: Câmera (Esquerda) + Condutores Autorizados (Direita)
+        area_superior = tk.Frame(self.tab_monitoramento, bg=CORES["bg_main"])
+        area_superior.pack(fill=tk.BOTH, expand=True, padx=25, pady=(15, 10))
+
+        # --- COLUNA ESQUERDA: VÍDEO AO VIVO ---
         container_video = tk.Frame(
-            self.tab_monitoramento,
+            area_superior,
             bg=CORES["bg_panel"],
             padx=8,
             pady=8,
             highlightthickness=1,
             highlightbackground=CORES["border"]
         )
-        container_video.pack(pady=15)
+        container_video.pack(side=tk.LEFT, anchor=tk.N)
 
         self.canvas = tk.Canvas(
             container_video,
@@ -219,15 +253,48 @@ class SistemaPortariaHibrido:
         # Cria o item de imagem uma única vez para evitar vazamento de memória (memory leak) no Canvas
         self.canvas_img_id = self.canvas.create_image(0, 0, anchor=tk.NW)
 
+        # --- COLUNA DIREITA: FOTOS DOS CONDUTORES AUTORIZADOS ---
+        self.painel_condutores = tk.Frame(
+            area_superior,
+            bg=CORES["bg_panel"],
+            padx=16,
+            pady=14,
+            highlightthickness=1,
+            highlightbackground=CORES["border"]
+        )
+        self.painel_condutores.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(18, 0))
+
+        tk.Label(
+            self.painel_condutores,
+            text="CONDUTORES AUTORIZADOS",
+            font=FONTES["secao"],
+            bg=CORES["bg_panel"],
+            fg=CORES["accent"]
+        ).pack(anchor=tk.W)
+
+        tk.Label(
+            self.painel_condutores,
+            text="Verifique se a pessoa ao volante e o veículo correspondem aos dados autorizados:",
+            font=FONTES["subtitulo_app"],
+            bg=CORES["bg_panel"],
+            fg=CORES["fg_muted"],
+            wraplength=400,
+            justify=tk.LEFT
+        ).pack(anchor=tk.W, pady=(2, 12))
+
+        self.container_cards_condutores = tk.Frame(self.painel_condutores, bg=CORES["bg_panel"])
+        self.container_cards_condutores.pack(fill=tk.BOTH, expand=True)
+
+        # --- BARRA INFERIOR DE STATUS ---
         self.frame_status = tk.Frame(
             self.tab_monitoramento,
             bg=CORES["bg_panel"],
             padx=25,
-            pady=16,
+            pady=14,
             highlightthickness=1,
             highlightbackground=CORES["border"]
         )
-        self.frame_status.pack(fill=tk.X, padx=25, pady=(5, 15))
+        self.frame_status.pack(fill=tk.X, padx=25, pady=(0, 15))
         self.frame_status.columnconfigure(0, weight=1)
         self.frame_status.columnconfigure(1, weight=1)
 
@@ -272,6 +339,162 @@ class SistemaPortariaHibrido:
             fg=CORES["fg_muted"]
         )
         self.lbl_vinculo.pack(anchor=tk.E, pady=(4, 0))
+
+        # Inicializa o painel de condutores no estado "aguardando"
+        self.atualizar_painel_condutores("")
+
+    def _gerar_avatar_padrao(self, tamanho=(110, 110), cor_borda="#334155"):
+        """Gera uma imagem placeholder elegante quando o condutor não tem foto cadastrada"""
+        largura, altura = tamanho
+        img = Image.new("RGB", tamanho, "#0f172a")
+        draw = ImageDraw.Draw(img)
+        cx = largura // 2
+        draw.ellipse((cx - 18, 22, cx + 18, 58), fill="#475569")
+        draw.pieslice((cx - 34, 62, cx + 34, 130), start=180, end=360, fill="#475569")
+        draw.rectangle((0, 0, largura - 1, altura - 1), outline=cor_borda, width=2)
+        return ImageTk.PhotoImage(img)
+
+    def _carregar_foto_condutor(self, foto_path, tamanho=(110, 110), cor_borda="#10b981"):
+        """Carrega e redimensiona a foto do condutor mantendo a proporção (crop central)"""
+        if foto_path:
+            caminho = Path(foto_path)
+            if not caminho.is_absolute():
+                caminho = Path(__file__).resolve().parent / caminho
+            if caminho.exists():
+                try:
+                    img = Image.open(caminho).convert("RGB")
+                    img = ImageOps.fit(img, tamanho, Image.Resampling.LANCZOS)
+                    draw = ImageDraw.Draw(img)
+                    draw.rectangle((0, 0, tamanho[0] - 1, tamanho[1] - 1), outline=cor_borda, width=2)
+                    return ImageTk.PhotoImage(img)
+                except Exception as e:
+                    print(f"Erro ao carregar foto '{caminho}': {e}")
+        return self._gerar_avatar_padrao(tamanho=tamanho, cor_borda=cor_borda)
+
+    def atualizar_painel_condutores(self, placa, condutores=None):
+        """Atualiza o painel lateral com as fotos dos condutores autorizados da placa lida"""
+        if self.placa_painel_renderizada == placa:
+            return
+        self.placa_painel_renderizada = placa
+
+        for widget in self.container_cards_condutores.winfo_children():
+            widget.destroy()
+        self.fotos_condutores_refs.clear()
+
+        if not placa:
+            aviso = tk.Frame(
+                self.container_cards_condutores,
+                bg=CORES["bg_main"],
+                padx=20,
+                pady=40,
+                highlightthickness=1,
+                highlightbackground=CORES["border"]
+            )
+            aviso.pack(fill=tk.BOTH, expand=True)
+            tk.Label(
+                aviso,
+                text="Aguardando leitura de placa...",
+                font=FONTES["secao"],
+                bg=CORES["bg_main"],
+                fg=CORES["fg_muted"]
+            ).pack(expand=True)
+            return
+
+        if not condutores:
+            # Placa não cadastrada (Visitante / Desconhecido)
+            alerta = tk.Frame(
+                self.container_cards_condutores,
+                bg=CORES["bg_main"],
+                padx=20,
+                pady=30,
+                highlightthickness=2,
+                highlightbackground=CORES["warning"]
+            )
+            alerta.pack(fill=tk.BOTH, expand=True)
+
+            tk.Label(
+                alerta,
+                text=f"PLACA: {placa}",
+                font=FONTES["placa_destaque"],
+                bg=CORES["bg_main"],
+                fg=CORES["warning"]
+            ).pack(pady=(10, 6))
+
+            tk.Label(
+                alerta,
+                text="VEÍCULO VISITANTE / NÃO CADASTRADO",
+                font=FONTES["secao"],
+                bg=CORES["bg_main"],
+                fg=CORES["warning"]
+            ).pack(pady=(0, 10))
+
+            tk.Label(
+                alerta,
+                text="Nenhum condutor autorizado vinculado a este veículo.\nAborde o motorista e realize a identificação na portaria antes de liberar o acesso.",
+                font=FONTES["label"],
+                bg=CORES["bg_main"],
+                fg=CORES["fg_text"],
+                wraplength=330,
+                justify=tk.CENTER
+            ).pack()
+            return
+
+        # Exibe um card com foto para cada condutor autorizado daquele veículo
+        for nome, unidade, veiculo, foto_path in condutores:
+            card = tk.Frame(
+                self.container_cards_condutores,
+                bg=CORES["bg_main"],
+                padx=12,
+                pady=10,
+                highlightthickness=1,
+                highlightbackground=CORES["success"]
+            )
+            card.pack(fill=tk.X, pady=(0, 10))
+
+            foto_tk = self._carregar_foto_condutor(foto_path, tamanho=(110, 110), cor_borda=CORES["success"])
+            self.fotos_condutores_refs.append(foto_tk)
+
+            lbl_foto = tk.Label(card, image=foto_tk, bg=CORES["bg_main"])
+            lbl_foto.pack(side=tk.LEFT, padx=(0, 14))
+
+            info = tk.Frame(card, bg=CORES["bg_main"])
+            info.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            tk.Label(
+                info,
+                text="CONDUTOR AUTORIZADO",
+                font=FONTES["subtitulo_app"],
+                bg=CORES["bg_main"],
+                fg=CORES["success"]
+            ).pack(anchor=tk.W)
+
+            tk.Label(
+                info,
+                text=nome,
+                font=FONTES["secao"],
+                bg=CORES["bg_main"],
+                fg=CORES["fg_text"],
+                wraplength=220,
+                justify=tk.LEFT
+            ).pack(anchor=tk.W, pady=(2, 2))
+
+            veiculo_txt = f"  •  Veículo: {veiculo}" if veiculo else ""
+            tk.Label(
+                info,
+                text=f"Unidade: {unidade}{veiculo_txt}",
+                font=FONTES["label_bold"],
+                bg=CORES["bg_main"],
+                fg=CORES["fg_muted"]
+            ).pack(anchor=tk.W)
+
+            status_foto = "Foto verificada" if foto_path else "Sem foto (edite na aba Moradores)"
+            tk.Label(
+                info,
+                text=f"Placa: {placa} • {status_foto}",
+                font=FONTES["subtitulo_app"],
+                bg=CORES["bg_main"],
+                fg=CORES["fg_muted"]
+            ).pack(anchor=tk.W, pady=(4, 0))
 
     def update_video(self):
         # A leitura agora puxa da variável da Thread, o que impede a interface (Tkinter) de congelar
@@ -330,7 +553,7 @@ class SistemaPortariaHibrido:
                 if resultado_ocr["confirmada"]:
                     self.placa_exibida = resultado_ocr["placa"]
                     self.coords_exibidas = resultado_ocr["coords"]
-                    self.timestamp_expira = tempo_atual + 5.0
+                    self.timestamp_expira = tempo_atual + 8.0  # 8s para o segurança conferir a foto do condutor com calma
                     self.retangulos_candidatos = []
         except queue.Empty:
             pass
@@ -348,15 +571,25 @@ class SistemaPortariaHibrido:
 
             self.lbl_placa.config(text=f"Placa Identificada: {self.placa_exibida}", fg=CORES["success"])
 
+            condutores = self.verificar_condutores(self.placa_exibida)
+            self.atualizar_painel_condutores(self.placa_exibida, condutores)
+
+            if condutores:
+                nomes = ", ".join(c[0] for c in condutores)
+                unidade_ref = condutores[0][1]
+                veiculo_ref = f" ({condutores[0][2]})" if condutores[0][2] else ""
+                vinculo_exibicao = f"Unidade {unidade_ref}{veiculo_ref} | Autorizado(s): {nomes}"
+                cor_vinculo = CORES["success"]
+            else:
+                vinculo_exibicao = "Visitante (Sem condutor cadastrado)"
+                cor_vinculo = CORES["warning"]
+
+            self.lbl_vinculo.config(text=vinculo_exibicao, fg=cor_vinculo)
+
             if (self.placa_exibida != self.ultima_placa_gravada or
                     tempo_atual - self.timestamp_ultimo_registro > 60):
-
-                morador = self.verificar_morador(self.placa_exibida)
-                vinculo = f"Morador: {morador[0]} ({morador[1]})" if morador else "Visitante"
-                self.lbl_vinculo.config(text=vinculo, fg=CORES["success"] if morador else CORES["warning"])
-
                 # Salva no banco de dados
-                self.registrar_movimento(self.placa_exibida, vinculo)
+                self.registrar_movimento(self.placa_exibida, vinculo_exibicao)
                 self.ultima_placa_gravada = self.placa_exibida
                 self.timestamp_ultimo_registro = tempo_atual
         else:
@@ -364,6 +597,7 @@ class SistemaPortariaHibrido:
                 self.placa_exibida = ""
                 self.coords_exibidas = (0, 0, 0, 0)
                 self.retangulos_candidatos = []
+                self.atualizar_painel_condutores("")
 
             self.lbl_placa.config(text="Buscando veículos...", fg=CORES["fg_muted"])
             self.lbl_vinculo.config(text="Vínculo: --", fg=CORES["fg_muted"])
@@ -534,11 +768,12 @@ class SistemaPortariaHibrido:
             ultimo = cursor.fetchone()
             return "SAÍDA" if ultimo and ultimo[0] == "ENTRADA" else "ENTRADA"
 
-    def verificar_morador(self, placa):
+    def verificar_condutores(self, placa):
+        """Retorna todos os condutores autorizados (nome, unidade, veiculo, foto_path) vinculados à placa"""
         with self.get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT nome, unidade FROM moradores WHERE placa = ?", (placa,))
-            return cursor.fetchone()
+            cursor.execute("SELECT nome, unidade, COALESCE(veiculo, ''), COALESCE(foto_path, '') FROM moradores WHERE placa = ? ORDER BY id ASC", (placa,))
+            return cursor.fetchall()
 
     def configurar_aba_historico(self):
         frame = tk.Frame(
@@ -560,7 +795,7 @@ class SistemaPortariaHibrido:
             "Tipo": ("Movimento", 110, tk.CENTER),
             "Data": ("Data", 110, tk.CENTER),
             "Horario": ("Horário", 110, tk.CENTER),
-            "Vinculo": ("Vínculo / Identificação", 320, tk.W),
+            "Vinculo": ("Vínculo / Identificação", 420, tk.W),
         }
         for col, (titulo, largura, alinhamento) in config_colunas.items():
             self.tree_historico.heading(col, text=titulo)
@@ -617,38 +852,84 @@ class SistemaPortariaHibrido:
         )
         frame.pack(fill=tk.X, padx=20, pady=(15, 10))
 
-        tk.Label(
+        self.lbl_titulo_form = tk.Label(
             frame,
-            text="NOVO CADASTRO DE MORADOR",
+            text="CADASTRO E EDIÇÃO DE CONDUTORES E VEÍCULOS (DÊ DUPLO CLIQUE NA TABELA PARA EDITAR)",
             font=FONTES["subtitulo_app"],
             bg=CORES["bg_panel"],
             fg=CORES["accent"]
-        ).pack(anchor=tk.W, pady=(0, 10))
+        )
+        self.lbl_titulo_form.pack(anchor=tk.W, pady=(0, 10))
 
         form_row = tk.Frame(frame, bg=CORES["bg_panel"])
         form_row.pack(fill=tk.X)
 
-        tk.Label(form_row, text="Nome:", font=FONTES["label_bold"], bg=CORES["bg_panel"], fg=CORES["fg_text"]).pack(side=tk.LEFT, padx=(0, 6))
-        self.ent_nome = self._criar_entry_estilizado(form_row, 22)
-        self.ent_nome.pack(side=tk.LEFT, padx=(0, 14), ipady=5)
+        tk.Label(form_row, text="Condutor:", font=FONTES["label_bold"], bg=CORES["bg_panel"], fg=CORES["fg_text"]).pack(side=tk.LEFT, padx=(0, 5))
+        self.ent_nome = self._criar_entry_estilizado(form_row, 18)
+        self.ent_nome.pack(side=tk.LEFT, padx=(0, 10), ipady=5)
 
-        tk.Label(form_row, text="Unidade:", font=FONTES["label_bold"], bg=CORES["bg_panel"], fg=CORES["fg_text"]).pack(side=tk.LEFT, padx=(0, 6))
-        self.ent_unidade = self._criar_entry_estilizado(form_row, 10)
-        self.ent_unidade.pack(side=tk.LEFT, padx=(0, 14), ipady=5)
+        tk.Label(form_row, text="Unidade:", font=FONTES["label_bold"], bg=CORES["bg_panel"], fg=CORES["fg_text"]).pack(side=tk.LEFT, padx=(0, 5))
+        self.ent_unidade = self._criar_entry_estilizado(form_row, 8)
+        self.ent_unidade.pack(side=tk.LEFT, padx=(0, 10), ipady=5)
 
-        tk.Label(form_row, text="Placa:", font=FONTES["label_bold"], bg=CORES["bg_panel"], fg=CORES["fg_text"]).pack(side=tk.LEFT, padx=(0, 6))
-        self.ent_placa = self._criar_entry_estilizado(form_row, 14)
-        self.ent_placa.pack(side=tk.LEFT, padx=(0, 18), ipady=5)
+        tk.Label(form_row, text="Placa:", font=FONTES["label_bold"], bg=CORES["bg_panel"], fg=CORES["fg_text"]).pack(side=tk.LEFT, padx=(0, 5))
+        self.ent_placa = self._criar_entry_estilizado(form_row, 10)
+        self.ent_placa.pack(side=tk.LEFT, padx=(0, 10), ipady=5)
+
+        tk.Label(form_row, text="Veículo/Cor:", font=FONTES["label_bold"], bg=CORES["bg_panel"], fg=CORES["fg_text"]).pack(side=tk.LEFT, padx=(0, 5))
+        self.ent_veiculo = self._criar_entry_estilizado(form_row, 16)
+        self.ent_veiculo.pack(side=tk.LEFT, padx=(0, 10), ipady=5)
 
         ttk.Button(
             form_row,
-            text="Salvar Morador",
+            text="Escolher Foto...",
+            style="Accent.TButton",
+            command=self.selecionar_foto_cadastro
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self.lbl_foto_escolhida = tk.Label(
+            form_row,
+            text="Sem foto selecionada",
+            font=FONTES["subtitulo_app"],
+            bg=CORES["bg_panel"],
+            fg=CORES["fg_muted"]
+        )
+        self.lbl_foto_escolhida.pack(side=tk.LEFT, padx=(0, 8))
+
+        botoes_row = tk.Frame(frame, bg=CORES["bg_panel"])
+        botoes_row.pack(fill=tk.X, pady=(12, 0))
+
+        self.btn_salvar = ttk.Button(
+            botoes_row,
+            text="Salvar Novo Condutor",
             style="Accent.TButton",
             command=self.salvar_morador
+        )
+        self.btn_salvar.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(
+            botoes_row,
+            text="Editar Selecionado",
+            style="Accent.TButton",
+            command=self.carregar_para_edicao
         ).pack(side=tk.LEFT, padx=(0, 8))
 
         ttk.Button(
-            form_row,
+            botoes_row,
+            text="Limpar / Cancelar Edição",
+            style="Accent.TButton",
+            command=self.limpar_formulario
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(
+            botoes_row,
+            text="Vincular / Trocar Foto Rápido",
+            style="Accent.TButton",
+            command=self.vincular_foto_selecionado
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(
+            botoes_row,
             text="Excluir Selecionado",
             style="Danger.TButton",
             command=self.excluir_morador
@@ -664,14 +945,16 @@ class SistemaPortariaHibrido:
         )
         frame_tb.pack(fill=tk.BOTH, expand=True, padx=20, pady=(5, 15))
 
-        colunas = ("ID", "Nome", "Unidade", "Placa")
+        colunas = ("ID", "Nome", "Unidade", "Placa", "Veiculo", "Foto")
         self.tree_moradores = ttk.Treeview(frame_tb, columns=colunas, show="headings")
 
         config_colunas = {
-            "ID": ("ID", 60, tk.CENTER),
-            "Nome": ("Nome do Morador", 340, tk.W),
-            "Unidade": ("Unidade / Apto", 160, tk.CENTER),
-            "Placa": ("Placa Veicular", 160, tk.CENTER),
+            "ID": ("ID", 55, tk.CENTER),
+            "Nome": ("Nome do Condutor Autorizado", 260, tk.W),
+            "Unidade": ("Unidade / Apto", 120, tk.CENTER),
+            "Placa": ("Placa Veicular", 120, tk.CENTER),
+            "Veiculo": ("Modelo / Cor do Veículo", 200, tk.CENTER),
+            "Foto": ("Foto de Verificação", 160, tk.CENTER),
         }
         for col, (titulo, largura, alinhamento) in config_colunas.items():
             self.tree_moradores.heading(col, text=titulo)
@@ -680,19 +963,127 @@ class SistemaPortariaHibrido:
         self.tree_moradores.tag_configure("par", background=CORES["row_even"])
         self.tree_moradores.tag_configure("impar", background=CORES["row_odd"])
 
+        # Permite dar duplo clique em qualquer linha da tabela para carregar os dados para edição
+        self.tree_moradores.bind("<Double-1>", lambda e: self.carregar_para_edicao())
+
         scrollbar = ttk.Scrollbar(frame_tb, orient=tk.VERTICAL, command=self.tree_moradores.yview)
         self.tree_moradores.configure(yscrollcommand=scrollbar.set)
 
         self.tree_moradores.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+    def selecionar_foto_cadastro(self):
+        caminho = filedialog.askopenfilename(
+            title="Selecionar Foto do Condutor Autorizado",
+            filetypes=[("Imagens", "*.jpg *.jpeg *.png *.bmp *.webp")]
+        )
+        if caminho:
+            self.foto_selecionada_temp = caminho
+            nome_arq = Path(caminho).name
+            if len(nome_arq) > 22:
+                nome_arq = nome_arq[:19] + "..."
+            self.lbl_foto_escolhida.config(text=f"Foto: {nome_arq}", fg=CORES["success"])
+
+    def _copiar_foto_para_pasta_local(self, origem_path, placa):
+        if not origem_path:
+            return ""
+        origem = Path(origem_path)
+        if not origem.exists():
+            return ""
+        ext = origem.suffix.lower() or ".jpg"
+        nome_destino = f"{placa}_{int(time.time() * 1000)}{ext}"
+        destino = self.pasta_fotos / nome_destino
+        shutil.copy2(origem, destino)
+        return str(Path("fotos_condutores") / nome_destino)
+
+    def carregar_para_edicao(self):
+        selecionado = self.tree_moradores.selection()
+        if not selecionado:
+            messagebox.showwarning("Aviso", "Selecione um registro na tabela para editar!")
+            return
+
+        valores = self.tree_moradores.item(selecionado[0], "values")
+        id_morador = valores[0]
+
+        with self.get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, nome, unidade, placa, COALESCE(veiculo, ''), COALESCE(foto_path, '') FROM moradores WHERE id = ?", (id_morador,))
+            reg = cursor.fetchone()
+
+        if not reg:
+            return
+
+        self.id_em_edicao = reg[0]
+        self.ent_nome.delete(0, tk.END)
+        self.ent_nome.insert(0, reg[1])
+
+        self.ent_unidade.delete(0, tk.END)
+        self.ent_unidade.insert(0, reg[2])
+
+        self.ent_placa.delete(0, tk.END)
+        self.ent_placa.insert(0, reg[3])
+
+        self.ent_veiculo.delete(0, tk.END)
+        self.ent_veiculo.insert(0, reg[4])
+
+        self.foto_selecionada_temp = ""
+        if reg[5]:
+            self.lbl_foto_escolhida.config(text="Mantendo foto atual (ou escolha outra)", fg=CORES["success"])
+        else:
+            self.lbl_foto_escolhida.config(text="Sem foto (escolha uma se desejar)", fg=CORES["fg_muted"])
+
+        self.lbl_titulo_form.config(
+            text=f"EDITANDO CADASTRO ID #{self.id_em_edicao} — Altere os campos desejados e clique em 'Salvar Alterações'",
+            fg=CORES["warning"]
+        )
+        self.btn_salvar.config(text=f"Salvar Alterações (ID #{self.id_em_edicao})")
+
+    def limpar_formulario(self):
+        self.id_em_edicao = None
+        self.ent_nome.delete(0, tk.END)
+        self.ent_unidade.delete(0, tk.END)
+        self.ent_placa.delete(0, tk.END)
+        self.ent_veiculo.delete(0, tk.END)
+        self.foto_selecionada_temp = ""
+        self.lbl_foto_escolhida.config(text="Sem foto selecionada", fg=CORES["fg_muted"])
+        self.lbl_titulo_form.config(
+            text="CADASTRO E EDIÇÃO DE CONDUTORES E VEÍCULOS (DÊ DUPLO CLIQUE NA TABELA PARA EDITAR)",
+            fg=CORES["accent"]
+        )
+        self.btn_salvar.config(text="Salvar Novo Condutor")
+
+    def vincular_foto_selecionado(self):
+        selecionado = self.tree_moradores.selection()
+        if not selecionado:
+            messagebox.showwarning("Aviso", "Selecione um condutor na tabela primeiro para vincular ou trocar a foto!")
+            return
+
+        valores = self.tree_moradores.item(selecionado[0], "values")
+        id_morador, nome, unidade, placa = valores[0], valores[1], valores[2], valores[3]
+
+        caminho = filedialog.askopenfilename(
+            title=f"Selecionar Foto para {nome} ({placa})",
+            filetypes=[("Imagens", "*.jpg *.jpeg *.png *.bmp *.webp")]
+        )
+        if not caminho:
+            return
+
+        caminho_salvo = self._copiar_foto_para_pasta_local(caminho, placa)
+        with self.get_db() as conn:
+            conn.execute("UPDATE moradores SET foto_path = ? WHERE id = ?", (caminho_salvo, id_morador))
+
+        self.placa_painel_renderizada = None  # Força atualização caso a placa esteja em exibição
+        self.atualizar_tabela_moradores()
+        messagebox.showinfo("Sucesso", f"Foto vinculada com sucesso ao condutor '{nome}' (Placa {placa})!")
+
     def salvar_morador(self):
         nome = self.ent_nome.get().strip()
         unidade = self.ent_unidade.get().strip()
         placa_digitada = self.ent_placa.get().strip().upper()
+        veiculo = self.ent_veiculo.get().strip()
 
         if not nome or not unidade or not placa_digitada:
-            messagebox.showwarning("Aviso", "Preencha todos os campos do cadastro!")
+            messagebox.showwarning("Aviso", "Preencha pelo menos Condutor, Unidade e Placa!")
             return
 
         placa_final = self.normalizar_placa(placa_digitada)
@@ -703,24 +1094,45 @@ class SistemaPortariaHibrido:
             )
             return
 
-        try:
+        if self.id_em_edicao is not None:
+            # Modo de Edição: atualiza o registro existente
             with self.get_db() as conn:
-                conn.execute("INSERT INTO moradores (nome, unidade, placa) VALUES (?, ?, ?)", (nome, unidade, placa_final))
+                if self.foto_selecionada_temp:
+                    caminho_salvo = self._copiar_foto_para_pasta_local(self.foto_selecionada_temp, placa_final)
+                    conn.execute(
+                        "UPDATE moradores SET nome = ?, unidade = ?, placa = ?, veiculo = ?, foto_path = ? WHERE id = ?",
+                        (nome, unidade, placa_final, veiculo, caminho_salvo, self.id_em_edicao)
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE moradores SET nome = ?, unidade = ?, placa = ?, veiculo = ? WHERE id = ?",
+                        (nome, unidade, placa_final, veiculo, self.id_em_edicao)
+                    )
 
-            self.ent_nome.delete(0, tk.END)
-            self.ent_unidade.delete(0, tk.END)
-            self.ent_placa.delete(0, tk.END)
-
+            id_editado = self.id_em_edicao
+            self.limpar_formulario()
+            self.placa_painel_renderizada = None
             self.atualizar_tabela_moradores()
-            messagebox.showinfo("Sucesso", f"Morador cadastrado! Placa salva como: {placa_final}")
+            messagebox.showinfo("Sucesso", f"Cadastro #{id_editado} atualizado com sucesso!")
+        else:
+            # Modo de Novo Cadastro
+            caminho_salvo = self._copiar_foto_para_pasta_local(self.foto_selecionada_temp, placa_final)
 
-        except sqlite3.IntegrityError:
-            messagebox.showerror("Erro", "Esta placa já pertence a outro morador.")
+            with self.get_db() as conn:
+                conn.execute(
+                    "INSERT INTO moradores (nome, unidade, placa, veiculo, foto_path) VALUES (?, ?, ?, ?, ?)",
+                    (nome, unidade, placa_final, veiculo, caminho_salvo)
+                )
+
+            self.limpar_formulario()
+            self.placa_painel_renderizada = None
+            self.atualizar_tabela_moradores()
+            messagebox.showinfo("Sucesso", f"Condutor '{nome}' autorizado para o veículo {placa_final}!")
 
     def excluir_morador(self):
         selecionado = self.tree_moradores.selection()
         if not selecionado:
-            messagebox.showwarning("Aviso", "Selecione um morador na tabela para excluir!")
+            messagebox.showwarning("Aviso", "Selecione um condutor na tabela para excluir!")
             return
 
         valores = self.tree_moradores.item(selecionado[0], "values")
@@ -728,23 +1140,28 @@ class SistemaPortariaHibrido:
 
         confirmar = messagebox.askyesno(
             "Confirmar Exclusão",
-            f"Deseja realmente remover o morador '{nome}' (Unidade {unidade} - Placa {placa})?"
+            f"Deseja realmente remover o condutor '{nome}' (Unidade {unidade} - Placa {placa})?"
         )
         if confirmar:
             with self.get_db() as conn:
                 conn.execute("DELETE FROM moradores WHERE id = ?", (id_morador,))
+            if self.id_em_edicao == int(id_morador):
+                self.limpar_formulario()
+            self.placa_painel_renderizada = None
             self.atualizar_tabela_moradores()
-            messagebox.showinfo("Sucesso", "Morador excluído com sucesso!")
+            messagebox.showinfo("Sucesso", "Condutor excluído com sucesso!")
 
     def atualizar_tabela_moradores(self):
         for item in self.tree_moradores.get_children():
             self.tree_moradores.delete(item)
         with self.get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM moradores ORDER BY nome ASC")
-            for idx, row in enumerate(cursor.fetchall()):
+            cursor.execute("SELECT id, nome, unidade, placa, COALESCE(veiculo, ''), COALESCE(foto_path, '') FROM moradores ORDER BY placa ASC, nome ASC")
+            for idx, (id_m, nome, unidade, placa, veiculo, foto_path) in enumerate(cursor.fetchall()):
                 tag = "par" if idx % 2 == 0 else "impar"
-                self.tree_moradores.insert("", tk.END, values=row, tags=(tag,))
+                status_foto = "Foto Cadastrada" if foto_path else "Sem Foto"
+                veiculo_exib = veiculo if veiculo else "--"
+                self.tree_moradores.insert("", tk.END, values=(id_m, nome, unidade, placa, veiculo_exib, status_foto), tags=(tag,))
 
     def on_closing(self):
         if hasattr(self, 'evento_parada'):
