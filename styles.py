@@ -142,3 +142,21 @@ def aplicar_tema():
         "Danger.TButton",
         background=[("active", CORES["danger_hover"])]
     )
+
+    # --- Estilo de Seletores (Combobox) ---
+    style.configure(
+        "TCombobox",
+        fieldbackground=CORES["input_bg"],
+        background=CORES["border"],
+        foreground=CORES["fg_text"],
+        arrowcolor=CORES["fg_text"],
+        bordercolor=CORES["border"],
+        padding=4
+    )
+    style.map(
+        "TCombobox",
+        fieldbackground=[("readonly", CORES["input_bg"])],
+        foreground=[("readonly", CORES["fg_text"])],
+        selectbackground=[("readonly", CORES["input_bg"])],
+        selectforeground=[("readonly", CORES["fg_text"])]
+    )
